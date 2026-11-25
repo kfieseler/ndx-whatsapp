@@ -25,6 +25,10 @@ const TZ = "America/Los_Angeles";
 const MEDIA_PREFIX = "media/"; // R2 key prefix for saved photos
 const MEDIA_PER_TICK = 10;
 const MAX_IMAGE_BYTES = 4_500_000;
+// One-time photo catch-up for messages stored before photo saving existed.
+const BACKFILL_VERSION = 1;
+const BACKFILL_DAYS = 14;
+const BACKFILL_COUNT = 100;
 // Send limits, to keep the unofficial bridge from looking like a bot to WhatsApp.
 const SEND_MAX_PER_HOUR = 20;
 const SEND_MIN_GAP_MS = 5_000;
@@ -120,6 +124,7 @@ export class Bridge extends DurableObject<Env> {
 			if (status?.state === "connected") {
 				await this.maybeBackup();
 				await this.maybeSyncGroups();
+				await this.maybeBackfillPhotos();
 				await this.saveMedia();
 			}
 			await this.ctx.storage.put("lastTick", Date.now());
@@ -233,6 +238,56 @@ export class Bridge extends DurableObject<Env> {
 		return bytes;
 	}
 
+	/**
+	 * One-time catch-up for photos stored before photo saving existed: ask the phone to
+	 * resend recent history for each group that has such photos. The resent messages
+	 * only fill in the missing download keys (see the ON CONFLICT in flush).
+	 * Runs one group per tick; set storage key "backfillVersion" lower to run again.
+	 */
+	private async maybeBackfillPhotos(): Promise<void> {
+		if (((await this.ctx.storage.get<number>("backfillVersion")) ?? 0) >= BACKFILL_VERSION) return;
+		const done = (await this.ctx.storage.get<string[]>("backfillDone")) ?? [];
+		const chats = await this.env.DB.prepare(
+			`SELECT chat_jid FROM messages
+			 WHERE kind = 'image' AND media IS NULL AND ts > unixepoch() - ?
+			 GROUP BY chat_jid ORDER BY MAX(ts) DESC`,
+		)
+			.bind(BACKFILL_DAYS * 86400)
+			.all<{ chat_jid: string }>();
+		const next = chats.results.find((c) => !done.includes(c.chat_jid));
+		if (!next) {
+			await this.ctx.storage.put("backfillVersion", BACKFILL_VERSION);
+			await this.ctx.storage.delete("backfillDone");
+			console.log("photo backfill finished");
+			return;
+		}
+		// Anchor on the newest message we have; the phone sends older ones.
+		const anchor = await this.env.DB.prepare(
+			`SELECT id, ts, from_me FROM messages WHERE chat_jid = ? ORDER BY ts DESC LIMIT 1`,
+		)
+			.bind(next.chat_jid)
+			.first<{ id: string; ts: number; from_me: number }>();
+		done.push(next.chat_jid);
+		await this.ctx.storage.put("backfillDone", done);
+		if (!anchor) return;
+		try {
+			await this.call("/backfill", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					chat_jid: next.chat_jid,
+					anchor_id: anchor.id.slice(next.chat_jid.length + 1),
+					anchor_ts: anchor.ts,
+					anchor_from_me: !!anchor.from_me,
+					count: BACKFILL_COUNT,
+				}),
+			});
+			console.log(`photo backfill requested for ${next.chat_jid}`);
+		} catch (err) {
+			console.warn("photo backfill request failed", next.chat_jid, String(err));
+		}
+	}
+
 	/** Copies new photos into R2 soon after they arrive, before WhatsApp's links expire. */
 	private async saveMedia(): Promise<void> {
 		const rows = await this.env.DB.prepare(
@@ -318,7 +373,10 @@ export class Bridge extends DurableObject<Env> {
 			`INSERT OR IGNORE INTO messages
 			 (id, chat_jid, chat_name, sender_jid, sender_name, ts, text, kind, quoted_id, quoted_text, from_me, stored_at,
 			  media, media_type)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			 ON CONFLICT(id) DO UPDATE SET
+			   media = COALESCE(messages.media, excluded.media),
+			   media_type = COALESCE(messages.media_type, excluded.media_type)`,
 		);
 		for (let round = 0; round < 20; round++) {
 			const items = await this.call<{ seq: number; msg: BufferedMsg }[]>("/messages?after=0&limit=500");
