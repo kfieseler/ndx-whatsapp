@@ -40,6 +40,9 @@ const (
 	sessionPath = dataDir + "/session.db"
 	bufferPath  = dataDir + "/buffer.db"
 	deviceName  = "NDX Yard Bridge"
+	// Bump when the bridge's HTTP API changes. The Worker restarts a container
+	// that reports an older version so it picks up the new image.
+	bridgeVersion = 2
 )
 
 type bridge struct {
@@ -151,6 +154,7 @@ func (b *bridge) handleStatus(w http.ResponseWriter, r *http.Request) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	writeJSON(w, map[string]any{
+		"version":    bridgeVersion,
 		"state":      b.state,
 		"detail":     b.detail,
 		"qr":         b.qr,
