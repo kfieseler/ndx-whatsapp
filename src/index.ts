@@ -288,7 +288,10 @@ export default {
 			return new Response(LINK_PAGE, { headers: { "content-type": "text/html; charset=utf-8" } });
 		}
 
-		return new Response("NDX WhatsApp Yard", { status: 200 });
+		// Only the bare root answers. Everything else (incl. /.well-known/oauth-* discovery)
+		// must 404 so Claude treats the connector as no-auth instead of looking for a sign-in service.
+		if (url.pathname === "/") return new Response("NDX WhatsApp Yard", { status: 200 });
+		return new Response("Not found", { status: 404 });
 	},
 
 	async scheduled(_event, env, ctx): Promise<void> {
