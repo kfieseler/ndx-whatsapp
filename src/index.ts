@@ -26,7 +26,10 @@ const MEDIA_PREFIX = "media/"; // R2 key prefix for saved photos
 const MEDIA_PER_TICK = 10;
 const MAX_IMAGE_BYTES = 4_500_000;
 // One-time photo catch-up for messages stored before photo saving existed.
-const BACKFILL_VERSION = 1;
+const BACKFILL_VERSION = 2; // 1 ran against the old bridge and did nothing
+// The bridge image this Worker expects (bridge/main.go bridgeVersion).
+const BRIDGE_VERSION = 2;
+const RESTART_COOLDOWN_MS = 30 * 60_000;
 const BACKFILL_DAYS = 14;
 const BACKFILL_COUNT = 100;
 // Send limits, to keep the unofficial bridge from looking like a bot to WhatsApp.
@@ -54,6 +57,7 @@ const COLS = `m.id, m.chat_jid, m.chat_name, m.sender_jid, m.sender_name, m.ts, 
 	m.quoted_id, m.quoted_text, m.from_me, (m.media IS NOT NULL OR m.media_saved = 1) AS has_media`;
 
 type BridgeStatus = {
+	version?: number;
 	state: string;
 	detail: string;
 	qr: string;
@@ -121,10 +125,11 @@ export class Bridge extends DurableObject<Env> {
 			await this.ensureSchema();
 			const status = await this.bootSession();
 			await this.flush();
+			if (await this.restartIfOutdated(status)) return;
 			if (status?.state === "connected") {
 				await this.maybeBackup();
 				await this.maybeSyncGroups();
-				await this.maybeBackfillPhotos();
+				if ((status.version ?? 1) >= BRIDGE_VERSION) await this.maybeBackfillPhotos();
 				await this.saveMedia();
 			}
 			await this.ctx.storage.put("lastTick", Date.now());
@@ -217,6 +222,25 @@ export class Bridge extends DurableObject<Env> {
 
 	// ── internals ──
 
+	/**
+	 * A running container keeps its old image across deploys. If it reports an older
+	 * bridge version, back up the login, stop it, and let the next tick start the new
+	 * image (the login is restored from R2, so no QR scan). At most once per cooldown.
+	 */
+	private async restartIfOutdated(status: BridgeStatus): Promise<boolean> {
+		if ((status.version ?? 1) >= BRIDGE_VERSION) return false;
+		const last = (await this.ctx.storage.get<number>("lastForcedRestart")) ?? 0;
+		if (Date.now() - last < RESTART_COOLDOWN_MS) return false;
+		await this.ctx.storage.put("lastForcedRestart", Date.now());
+		if (status.state === "connected") {
+			await this.ctx.storage.delete("lastBackup");
+			await this.maybeBackup(); // fresh login backup before stopping
+		}
+		console.log(`bridge v${status.version ?? 1} is outdated; restarting container for v${BRIDGE_VERSION}`);
+		await this.ctx.container!.destroy();
+		return true;
+	}
+
 	private async downloadAndSave(id: string, media: string, type: string): Promise<ArrayBuffer> {
 		const res = await this.ctx.container!.getTcpPort(PORT).fetch("http://container/media", {
 			method: "POST",
@@ -246,7 +270,7 @@ export class Bridge extends DurableObject<Env> {
 	 */
 	private async maybeBackfillPhotos(): Promise<void> {
 		if (((await this.ctx.storage.get<number>("backfillVersion")) ?? 0) >= BACKFILL_VERSION) return;
-		const done = (await this.ctx.storage.get<string[]>("backfillDone")) ?? [];
+		const done = (await this.ctx.storage.get<string[]>(`backfillDone:v${BACKFILL_VERSION}`)) ?? [];
 		const chats = await this.env.DB.prepare(
 			`SELECT chat_jid FROM messages
 			 WHERE kind = 'image' AND media IS NULL AND ts > unixepoch() - ?
@@ -257,7 +281,7 @@ export class Bridge extends DurableObject<Env> {
 		const next = chats.results.find((c) => !done.includes(c.chat_jid));
 		if (!next) {
 			await this.ctx.storage.put("backfillVersion", BACKFILL_VERSION);
-			await this.ctx.storage.delete("backfillDone");
+			await this.ctx.storage.delete(`backfillDone:v${BACKFILL_VERSION}`);
 			console.log("photo backfill finished");
 			return;
 		}
@@ -267,9 +291,11 @@ export class Bridge extends DurableObject<Env> {
 		)
 			.bind(next.chat_jid)
 			.first<{ id: string; ts: number; from_me: number }>();
-		done.push(next.chat_jid);
-		await this.ctx.storage.put("backfillDone", done);
-		if (!anchor) return;
+		if (!anchor) {
+			done.push(next.chat_jid);
+			await this.ctx.storage.put(`backfillDone:v${BACKFILL_VERSION}`, done);
+			return;
+		}
 		try {
 			await this.call("/backfill", {
 				method: "POST",
@@ -283,6 +309,8 @@ export class Bridge extends DurableObject<Env> {
 				}),
 			});
 			console.log(`photo backfill requested for ${next.chat_jid}`);
+			done.push(next.chat_jid);
+			await this.ctx.storage.put(`backfillDone:v${BACKFILL_VERSION}`, done);
 		} catch (err) {
 			console.warn("photo backfill request failed", next.chat_jid, String(err));
 		}
