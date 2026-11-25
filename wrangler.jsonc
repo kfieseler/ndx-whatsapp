@@ -1,0 +1,45 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "ndx-whatsapp",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-11-20",
+	"compatibility_flags": ["nodejs_compat"],
+	"observability": { "enabled": true },
+
+	// The WhatsApp bridge (Go, whatsmeow) runs in one always-on container.
+	"containers": [
+		{
+			"class_name": "Bridge",
+			"scheduling_policy": "durable_object",
+			"images": {
+				"base": {
+					"dockerfile": "./bridge/Dockerfile",
+					"build_context": "./bridge"
+				}
+			}
+		}
+	],
+	"durable_objects": {
+		"bindings": [{ "name": "BRIDGE", "class_name": "Bridge" }]
+	},
+	"exports": {
+		"Bridge": { "type": "durable-object", "storage": "sqlite" }
+	},
+
+	// Group messages live here.
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "ndx-whatsapp",
+			"database_id": "b02853a6-4dd1-4f2f-9db8-faf3d59b8e10"
+		}
+	],
+	// WhatsApp login backup, so restarts and deploys don't require a new QR scan.
+	"r2_buckets": [{ "binding": "BLOBS", "bucket_name": "ndx-whatsapp-blobs" }],
+
+	// Watchdog: wakes the bridge if its 1-minute alarm loop ever stops.
+	"triggers": { "crons": ["*/5 * * * *"] }
+
+	// Secret (set in the dashboard, never in this file):
+	//   ACCESS_KEY  long random string; protects the QR page and the Claude connector URL.
+}

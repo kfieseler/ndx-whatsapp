@@ -1,0 +1,20 @@
+{
+  "name": "ndx-whatsapp",
+  "version": "1.0.0",
+  "description": "NDX WhatsApp Yard: read-only sync of WhatsApp group chats to D1 + Claude connector",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "types": "wrangler types",
+    "check": "tsc -p ."
+  },
+  "devDependencies": {
+    "@types/qrcode": "^1.5.6",
+    "typescript": "^7.0.2",
+    "wrangler": "^4.168.0"
+  },
+  "dependencies": {
+    "qrcode": "^1.5.4"
+  },
+  "private": true
+}
