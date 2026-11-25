@@ -21,6 +21,10 @@ const BACKUP_EVERY_MS = 10 * 60_000;
 const GROUPS_EVERY_MS = 30 * 60_000;
 const INACTIVITY_MS = 6 * 60 * 60_000; // max allowed; the 1-minute alarm keeps it alive anyway
 const SESSION_KEY = "whatsapp/session.db";
+// Name of the one Bridge instance that should run. Changing it starts a fresh
+// Durable Object (and container) on the current code and image; any instance with
+// another name stops its container the next time it runs.
+const BRIDGE_NAME = "main-v2";
 const TZ = "America/Los_Angeles";
 const MEDIA_PREFIX = "media/"; // R2 key prefix for saved photos
 const MEDIA_PER_TICK = 10;
@@ -120,6 +124,13 @@ export class Bridge extends DurableObject<Env> {
 	}
 
 	async alarm(): Promise<void> {
+		if (this.ctx.id.name && this.ctx.id.name !== BRIDGE_NAME) {
+			// Retired instance: stop its container and its alarm loop for good.
+			console.log(`retiring bridge instance "${this.ctx.id.name}"`);
+			if (this.ctx.container?.running) await this.ctx.container.destroy();
+			await this.ctx.storage.deleteAlarm();
+			return;
+		}
 		try {
 			await this.ensureRunning();
 			await this.ensureSchema();
@@ -475,7 +486,7 @@ export default {
 		if (!env.ACCESS_KEY) {
 			return new Response("Set the ACCESS_KEY secret on this Worker first.", { status: 503 });
 		}
-		const bridge = env.BRIDGE.getByName("main");
+		const bridge = env.BRIDGE.getByName(BRIDGE_NAME);
 
 		// Claude connector
 		const mcp = url.pathname.match(/^\/mcp\/([^/]+)\/?$/);
@@ -509,7 +520,7 @@ export default {
 	},
 
 	async scheduled(_event, env, ctx): Promise<void> {
-		const stub = env.BRIDGE.getByName("main") as unknown as DurableObjectStub<Bridge>;
+		const stub = env.BRIDGE.getByName(BRIDGE_NAME) as unknown as DurableObjectStub<Bridge>;
 		ctx.waitUntil(stub.poke());
 	},
 } satisfies ExportedHandler<Env>;
