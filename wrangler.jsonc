@@ -5,6 +5,7 @@
 	"compatibility_date": "2026-11-20",
 	"compatibility_flags": ["nodejs_compat"],
 	"observability": { "enabled": true },
+	"keep_vars": true,
 
 	// The WhatsApp bridge (Go, whatsmeow) runs in one always-on container.
 	"containers": [
