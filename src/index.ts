@@ -309,14 +309,7 @@ export class Bridge extends DurableObject<Env> {
 
 	private async ensureSchema(): Promise<void> {
 		if (this.schemaReady) return;
-		await this.env.DB.batch(SCHEMA.map((s) => this.env.DB.prepare(s)));
-		for (const m of MIGRATIONS) {
-			try {
-				await this.env.DB.prepare(m).run();
-			} catch {
-				// column already exists
-			}
-		}
+		await ensureDbSchema(this.env.DB);
 		this.schemaReady = true;
 	}
 
@@ -370,6 +363,22 @@ export class Bridge extends DurableObject<Env> {
 		}
 		await this.ctx.storage.put("lastGroups", Date.now());
 	}
+}
+
+// ───────────────────────── Schema ─────────────────────────
+
+let dbSchemaReady = false;
+/** Creates tables and adds newer columns. Safe to run any number of times. */
+async function ensureDbSchema(db: D1Database): Promise<void> {
+	if (dbSchemaReady) return;
+	await db.batch(SCHEMA.map((s) => db.prepare(s)));
+	const cols = await db.prepare(`SELECT name FROM pragma_table_info('messages')`).all<{ name: string }>();
+	const have = new Set(cols.results.map((c) => c.name));
+	for (const m of MIGRATIONS) {
+		const col = m.match(/ADD COLUMN (\w+)/)?.[1];
+		if (col && !have.has(col)) await db.prepare(m).run();
+	}
+	dbSchemaReady = true;
 }
 
 // ───────────────────────── Worker entry ─────────────────────────
@@ -551,6 +560,7 @@ type Content = { type: "text"; text: string } | { type: "image"; data: string; m
 
 async function callTool(name: string, args: any, env: Env, bridge: DurableObjectStub<Bridge>): Promise<string | Content[]> {
 	const db = env.DB;
+	await ensureDbSchema(db);
 	switch (name) {
 		case "get_media": {
 			const row = await findMessage(db, args.message_id);
