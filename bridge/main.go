@@ -2,12 +2,15 @@
 //
 // Links to WhatsApp as a companion device (like WhatsApp Web) and buffers every
 // GROUP message so the Cloudflare Durable Object can move it into D1.
-// READ-ONLY: this program never sends messages, read receipts or presence.
+// It never sends read receipts or presence. It sends a message only when the
+// Worker calls POST /send (the Claude connector's send_message tool), and only
+// to groups.
 package main
 
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -29,6 +32,7 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
+	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -64,6 +68,10 @@ type bufferedMsg struct {
 	QuotedID   string `json:"quoted_id,omitempty"`
 	QuotedText string `json:"quoted_text,omitempty"`
 	FromMe     bool   `json:"from_me"`
+	// Photos only: the WhatsApp ImageMessage (base64 protobuf), which holds the
+	// keys needed to download and decrypt the picture later via POST /media.
+	Media     string `json:"media,omitempty"`
+	MediaType string `json:"media_type,omitempty"`
 }
 
 func main() {
@@ -94,6 +102,8 @@ func main() {
 	mux.HandleFunc("/messages", b.handleMessages)
 	mux.HandleFunc("/ack", b.handleAck)
 	mux.HandleFunc("/groups", b.handleGroups)
+	mux.HandleFunc("/send", b.handleSend)
+	mux.HandleFunc("/media", b.handleMedia)
 
 	srv := &http.Server{Addr: ":8080", Handler: mux}
 	go func() {
@@ -314,6 +324,159 @@ func (b *bridge) handleGroups(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, out)
 }
 
+type sendReq struct {
+	ChatJID string `json:"chat_jid"`
+	Text    string `json:"text"`
+	// Optional reply: the WhatsApp message ID (without the "chat:" prefix),
+	// who sent it, and its text so WhatsApp can show the quote.
+	ReplyToID     string `json:"reply_to_id,omitempty"`
+	ReplyToSender string `json:"reply_to_sender,omitempty"`
+	ReplyToText   string `json:"reply_to_text,omitempty"`
+}
+
+// handleSend posts one text message to a group. Groups only.
+func (b *bridge) handleSend(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", 405)
+		return
+	}
+	var req sendReq
+	if err := json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&req); err != nil {
+		http.Error(w, "bad json: "+err.Error(), 400)
+		return
+	}
+	req.Text = strings.TrimSpace(req.Text)
+	if req.Text == "" {
+		http.Error(w, "empty text", 400)
+		return
+	}
+	chat, err := types.ParseJID(req.ChatJID)
+	if err != nil || chat.Server != types.GroupServer {
+		http.Error(w, "chat_jid must be a group (@g.us)", 400)
+		return
+	}
+	b.mu.Lock()
+	cli := b.client
+	b.mu.Unlock()
+	if cli == nil || !cli.IsLoggedIn() {
+		http.Error(w, "not connected", 503)
+		return
+	}
+
+	msg := &waE2E.Message{}
+	if req.ReplyToID != "" {
+		ctxInfo := &waE2E.ContextInfo{
+			StanzaID:      proto.String(req.ReplyToID),
+			QuotedMessage: &waE2E.Message{Conversation: proto.String(req.ReplyToText)},
+		}
+		if req.ReplyToSender != "" {
+			ctxInfo.Participant = proto.String(req.ReplyToSender)
+		}
+		msg.ExtendedTextMessage = &waE2E.ExtendedTextMessage{Text: proto.String(req.Text), ContextInfo: ctxInfo}
+	} else {
+		msg.Conversation = proto.String(req.Text)
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	resp, err := cli.SendMessage(ctx, chat, msg)
+	if err != nil {
+		http.Error(w, "send failed: "+err.Error(), 502)
+		return
+	}
+	log.Printf("sent message %s to %s", resp.ID, chat)
+
+	// Our own sends don't come back as events, so store a copy for the database.
+	b.mu.Lock()
+	chatName := b.groups[chat.String()]
+	self := b.selfJID
+	b.mu.Unlock()
+	if sj, err := types.ParseJID(self); err == nil {
+		self = sj.ToNonAD().String()
+	}
+	m := bufferedMsg{
+		ID:         chat.String() + ":" + resp.ID,
+		ChatJID:    chat.String(),
+		ChatName:   chatName,
+		SenderJID:  self,
+		SenderName: "Me",
+		TS:         resp.Timestamp.Unix(),
+		Text:       req.Text,
+		Kind:       "text",
+		QuotedID:   req.ReplyToID,
+		QuotedText: truncate(req.ReplyToText, 300),
+		FromMe:     true,
+	}
+	payload, _ := json.Marshal(m)
+	if _, err := b.buf.Exec(`INSERT OR IGNORE INTO buf (msg_id, payload) VALUES (?, ?)`, m.ID, string(payload)); err != nil {
+		log.Printf("buffer insert (sent): %v", err)
+	}
+	writeJSON(w, map[string]any{"ok": true, "id": resp.ID, "ts": resp.Timestamp.Unix()})
+}
+
+// handleMedia downloads and decrypts one photo. POST body: {"media": "<base64 ImageMessage>"}.
+// Returns the image bytes.
+func (b *bridge) handleMedia(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", 405)
+		return
+	}
+	var req struct {
+		Media string `json:"media"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 256<<10)).Decode(&req); err != nil {
+		http.Error(w, "bad json: "+err.Error(), 400)
+		return
+	}
+	raw, err := base64.StdEncoding.DecodeString(req.Media)
+	if err != nil {
+		http.Error(w, "bad media", 400)
+		return
+	}
+	img := &waE2E.ImageMessage{}
+	if err := proto.Unmarshal(raw, img); err != nil {
+		http.Error(w, "bad media", 400)
+		return
+	}
+	b.mu.Lock()
+	cli := b.client
+	b.mu.Unlock()
+	if cli == nil || !cli.IsLoggedIn() {
+		http.Error(w, "not connected", 503)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+	data, err := cli.Download(ctx, img)
+	if err != nil {
+		// 404/410 from WhatsApp means the file has expired off its servers.
+		http.Error(w, "download failed: "+err.Error(), 502)
+		return
+	}
+	w.Header().Set("Content-Type", firstNonEmpty(img.GetMimetype(), "image/jpeg"))
+	w.Write(data)
+}
+
+// imageOf finds a photo inside a message (including view-once / ephemeral wrappers).
+func imageOf(msg *waE2E.Message) *waE2E.ImageMessage {
+	if msg == nil {
+		return nil
+	}
+	if img := msg.GetImageMessage(); img != nil {
+		return img
+	}
+	if inner := msg.GetEphemeralMessage().GetMessage(); inner != nil {
+		return imageOf(inner)
+	}
+	if inner := msg.GetViewOnceMessage().GetMessage(); inner != nil {
+		return imageOf(inner)
+	}
+	if inner := msg.GetViewOnceMessageV2().GetMessage(); inner != nil {
+		return imageOf(inner)
+	}
+	return nil
+}
+
 // ---------- WhatsApp client ----------
 
 func (b *bridge) start() {
@@ -529,6 +692,12 @@ func (b *bridge) bufferMessage(evt *events.Message) bool {
 		QuotedID:   quotedID,
 		QuotedText: truncate(quotedText, 300),
 		FromMe:     info.IsFromMe,
+	}
+	if img := imageOf(evt.Message); img != nil && img.GetDirectPath() != "" {
+		if raw, err := proto.Marshal(img); err == nil {
+			m.Media = base64.StdEncoding.EncodeToString(raw)
+			m.MediaType = firstNonEmpty(img.GetMimetype(), "image/jpeg")
+		}
 	}
 	payload, _ := json.Marshal(m)
 	if _, err := b.buf.Exec(`INSERT OR IGNORE INTO buf (msg_id, payload) VALUES (?, ?)`, m.ID, string(payload)); err != nil {

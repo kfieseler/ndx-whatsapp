@@ -1,7 +1,8 @@
 // NDX WhatsApp Yard — Cloudflare Worker
 //
 //  /link?key=...        QR page to link WhatsApp (Settings > Linked Devices > Link a Device)
-//  /mcp/<key>           Claude connector (read-only tools over the group-message database)
+//  /mcp/<key>           Claude connector (read the group-message database, view photos,
+//                       and send a message to a group)
 //
 // The Bridge Durable Object keeps the whatsmeow container running, moves buffered
 // group messages into D1 every minute, and backs the WhatsApp login up to R2.
@@ -21,6 +22,13 @@ const GROUPS_EVERY_MS = 30 * 60_000;
 const INACTIVITY_MS = 6 * 60 * 60_000; // max allowed; the 1-minute alarm keeps it alive anyway
 const SESSION_KEY = "whatsapp/session.db";
 const TZ = "America/Los_Angeles";
+const MEDIA_PREFIX = "media/"; // R2 key prefix for saved photos
+const MEDIA_PER_TICK = 10;
+const MAX_IMAGE_BYTES = 4_500_000;
+// Send limits, to keep the unofficial bridge from looking like a bot to WhatsApp.
+const SEND_MAX_PER_HOUR = 20;
+const SEND_MIN_GAP_MS = 5_000;
+const SEND_MAX_CHARS = 2_000;
 
 const SCHEMA = [
 	`CREATE TABLE IF NOT EXISTS messages (
@@ -31,6 +39,15 @@ const SCHEMA = [
 	`CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages (ts)`,
 	`CREATE TABLE IF NOT EXISTS groups (jid TEXT PRIMARY KEY, name TEXT, participants INTEGER, updated_at INTEGER)`,
 ];
+// Added later; each may already exist, so errors are ignored.
+const MIGRATIONS = [
+	`ALTER TABLE messages ADD COLUMN media TEXT`, // base64 WhatsApp ImageMessage (download keys)
+	`ALTER TABLE messages ADD COLUMN media_type TEXT`,
+	`ALTER TABLE messages ADD COLUMN media_saved INTEGER`, // 1 = photo copied to R2, -1 = download failed
+];
+// Columns the connector reads (never the bulky media blob).
+const COLS = `m.id, m.chat_jid, m.chat_name, m.sender_jid, m.sender_name, m.ts, m.text, m.kind,
+	m.quoted_id, m.quoted_text, m.from_me, (m.media IS NOT NULL OR m.media_saved = 1) AS has_media`;
 
 type BridgeStatus = {
 	state: string;
@@ -65,7 +82,11 @@ type BufferedMsg = {
 	quoted_id?: string;
 	quoted_text?: string;
 	from_me: boolean;
+	media?: string;
+	media_type?: string;
 };
+
+type SendArgs = { group?: string; text?: string; reply_to?: string };
 
 // ───────────────────────── Bridge Durable Object ─────────────────────────
 
@@ -99,6 +120,7 @@ export class Bridge extends DurableObject<Env> {
 			if (status?.state === "connected") {
 				await this.maybeBackup();
 				await this.maybeSyncGroups();
+				await this.saveMedia();
 			}
 			await this.ctx.storage.put("lastTick", Date.now());
 		} catch (err) {
@@ -140,7 +162,95 @@ export class Bridge extends DurableObject<Env> {
 		await this.call("/reset", { method: "POST" });
 	}
 
+	/** Returns a photo as base64, from R2 or freshly downloaded from WhatsApp. */
+	async getMedia(id: string): Promise<{ data: string; type: string; bytes: number }> {
+		await this.ensureSchema();
+		const row = await this.env.DB.prepare(`SELECT id, media, media_type FROM messages WHERE id = ?`)
+			.bind(id)
+			.first<{ id: string; media: string | null; media_type: string | null }>();
+		if (!row) throw new Error(`No message with id ${id}`);
+		let obj = await this.env.BLOBS.get(MEDIA_PREFIX + id);
+		let bytes: ArrayBuffer;
+		let type = row.media_type || "image/jpeg";
+		if (obj) {
+			bytes = await obj.arrayBuffer();
+			type = obj.httpMetadata?.contentType || type;
+		} else {
+			if (!row.media) throw new Error("That message has no downloadable photo (photos from before Nov 25, 2026 weren't saved).");
+			await this.ensureRunning();
+			bytes = await this.downloadAndSave(id, row.media, type);
+		}
+		if (bytes.byteLength > MAX_IMAGE_BYTES) throw new Error(`Photo is too large to show (${bytes.byteLength} bytes).`);
+		return { data: toBase64(bytes), type, bytes: bytes.byteLength };
+	}
+
+	/** Sends one text message to one group, with rate limits. */
+	async send(chatJid: string, text: string, reply?: { id: string; sender: string; text: string }): Promise<{ id: string; ts: number }> {
+		const now = Date.now();
+		const log = ((await this.ctx.storage.get<number[]>("sendLog")) ?? []).filter((t) => now - t < 3600_000);
+		if (log.length >= SEND_MAX_PER_HOUR) throw new Error(`Send limit reached (${SEND_MAX_PER_HOUR} per hour). Try again later.`);
+		const lastSend = log.length ? log[log.length - 1] : 0;
+		if (now - lastSend < SEND_MIN_GAP_MS) await sleep(SEND_MIN_GAP_MS - (now - lastSend));
+		await this.ensureRunning();
+		const res = await this.call<{ ok: boolean; id: string; ts: number }>("/send", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				chat_jid: chatJid,
+				text,
+				reply_to_id: reply?.id,
+				reply_to_sender: reply?.sender,
+				reply_to_text: reply?.text,
+			}),
+		});
+		log.push(Date.now());
+		await this.ctx.storage.put("sendLog", log);
+		await this.ensureSchema();
+		await this.flush(); // put the sent message in D1 right away
+		return { id: res.id, ts: res.ts };
+	}
+
 	// ── internals ──
+
+	private async downloadAndSave(id: string, media: string, type: string): Promise<ArrayBuffer> {
+		const res = await this.ctx.container!.getTcpPort(PORT).fetch("http://container/media", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ media }),
+		});
+		if (!res.ok) {
+			const why = await res.text();
+			if (res.status === 502) {
+				await this.env.DB.prepare(`UPDATE messages SET media_saved = -1 WHERE id = ?`).bind(id).run();
+			}
+			throw new Error(`Couldn't download the photo: ${why.trim()}`);
+		}
+		const bytes = await res.arrayBuffer();
+		await this.env.BLOBS.put(MEDIA_PREFIX + id, bytes, {
+			httpMetadata: { contentType: res.headers.get("content-type") || type },
+		});
+		await this.env.DB.prepare(`UPDATE messages SET media_saved = 1 WHERE id = ?`).bind(id).run();
+		return bytes;
+	}
+
+	/** Copies new photos into R2 soon after they arrive, before WhatsApp's links expire. */
+	private async saveMedia(): Promise<void> {
+		const rows = await this.env.DB.prepare(
+			`SELECT id, media, media_type FROM messages
+			 WHERE media IS NOT NULL AND media_saved IS NULL AND ts > unixepoch() - 30*86400
+			 ORDER BY ts DESC LIMIT ?`,
+		)
+			.bind(MEDIA_PER_TICK)
+			.all<{ id: string; media: string; media_type: string | null }>();
+		for (const r of rows.results) {
+			try {
+				await this.downloadAndSave(r.id, r.media, r.media_type || "image/jpeg");
+			} catch (err) {
+				console.warn("photo save failed", r.id, String(err));
+			}
+		}
+	}
+
 
 	private async ensureRunning(): Promise<void> {
 		this.starting ??= this.startAndWait().finally(() => {
@@ -200,14 +310,22 @@ export class Bridge extends DurableObject<Env> {
 	private async ensureSchema(): Promise<void> {
 		if (this.schemaReady) return;
 		await this.env.DB.batch(SCHEMA.map((s) => this.env.DB.prepare(s)));
+		for (const m of MIGRATIONS) {
+			try {
+				await this.env.DB.prepare(m).run();
+			} catch {
+				// column already exists
+			}
+		}
 		this.schemaReady = true;
 	}
 
 	private async flush(): Promise<void> {
 		const insert = this.env.DB.prepare(
 			`INSERT OR IGNORE INTO messages
-			 (id, chat_jid, chat_name, sender_jid, sender_name, ts, text, kind, quoted_id, quoted_text, from_me, stored_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			 (id, chat_jid, chat_name, sender_jid, sender_name, ts, text, kind, quoted_id, quoted_text, from_me, stored_at,
+			  media, media_type)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		);
 		for (let round = 0; round < 20; round++) {
 			const items = await this.call<{ seq: number; msg: BufferedMsg }[]>("/messages?after=0&limit=500");
@@ -218,6 +336,7 @@ export class Bridge extends DurableObject<Env> {
 					insert.bind(
 						m.id, m.chat_jid, m.chat_name || null, m.sender_jid || null, m.sender_name || null, m.ts,
 						m.text || null, m.kind || null, m.quoted_id || null, m.quoted_text || null, m.from_me ? 1 : 0, now,
+						m.media || null, m.media_type || null,
 					),
 				);
 				await this.env.DB.batch(chunk);
@@ -334,6 +453,34 @@ const TOOLS = [
 		annotations: { readOnlyHint: true },
 	},
 	{
+		name: "get_media",
+		description:
+			"Show a photo from a WhatsApp group message. Messages with a photo end in `(photo)` and every message ends in `#<id>`; pass that id. Use it to look at part photos, nameplates, damage, packing slips.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				message_id: { type: "string", description: "The id shown after # on the message line." },
+			},
+			required: ["message_id"],
+		},
+		annotations: { readOnlyHint: true },
+	},
+	{
+		name: "send_message",
+		description:
+			"Send a text message to ONE WhatsApp group as Kaden. Only send text Kaden has seen and approved word for word in this conversation. Groups only. To reply to a specific message, pass its id from get_messages/search_messages as reply_to. Limited to 20 sends per hour.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				group: { type: "string", description: "Group name (must match one group; partial OK if unique) or group JID." },
+				text: { type: "string", description: "The exact message to send. Max 2,000 characters." },
+				reply_to: { type: "string", description: "Optional: id of the message to quote-reply to (shown after #)." },
+			},
+			required: ["group", "text"],
+		},
+		annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+	},
+	{
 		name: "list_groups",
 		description: "List the WhatsApp groups being synced, with message counts and last activity.",
 		inputSchema: { type: "object", properties: {} },
@@ -378,9 +525,9 @@ async function handleRpc(msg: RpcReq, env: Env, bridge: DurableObjectStub<Bridge
 			return reply({
 				protocolVersion: msg.params?.protocolVersion ?? "2025-06-18",
 				capabilities: { tools: {} },
-				serverInfo: { name: "ndx-whatsapp-yard", version: "1.0.0" },
+				serverInfo: { name: "ndx-whatsapp-yard", version: "1.1.0" },
 				instructions:
-					"Read-only access to NDX's WhatsApp group chats (parts orders, ETAs, shop projects). Times are Pacific, 12-hour. Nothing here can send messages.",
+					"Access to NDX's WhatsApp group chats (parts orders, ETAs, shop projects). Times are Pacific, 12-hour. Each message line ends in #<id>; photos are marked (photo) and can be viewed with get_media. send_message posts as Kaden: show him the exact text and group first and send only after he approves it.",
 			});
 		case "ping":
 			return reply({});
@@ -388,8 +535,9 @@ async function handleRpc(msg: RpcReq, env: Env, bridge: DurableObjectStub<Bridge
 			return reply({ tools: TOOLS });
 		case "tools/call": {
 			try {
-				const text = await callTool(msg.params?.name, msg.params?.arguments ?? {}, env, bridge);
-				return reply({ content: [{ type: "text", text }] });
+				const out = await callTool(msg.params?.name, msg.params?.arguments ?? {}, env, bridge);
+				if (typeof out !== "string") return reply({ content: out });
+				return reply({ content: [{ type: "text", text: out }] });
 			} catch (err) {
 				return reply({ content: [{ type: "text", text: `Error: ${String(err)}` }], isError: true });
 			}
@@ -399,9 +547,36 @@ async function handleRpc(msg: RpcReq, env: Env, bridge: DurableObjectStub<Bridge
 	}
 }
 
-async function callTool(name: string, args: any, env: Env, bridge: DurableObjectStub<Bridge>): Promise<string> {
+type Content = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
+
+async function callTool(name: string, args: any, env: Env, bridge: DurableObjectStub<Bridge>): Promise<string | Content[]> {
 	const db = env.DB;
 	switch (name) {
+		case "get_media": {
+			const row = await findMessage(db, args.message_id);
+			const img = await bridge.getMedia(row.id);
+			return [
+				{ type: "image", data: img.data, mimeType: img.type },
+				{ type: "text", text: `Photo from ${row.gname}, ${row.who} at ${fmtTime(row.ts)}. ${row.text ?? ""}`.trim() },
+			];
+		}
+
+		case "send_message": {
+			const a = args as SendArgs;
+			const text = String(a.text ?? "").trim();
+			if (!text) return "Nothing to send: text is empty.";
+			if (text.length > SEND_MAX_CHARS) return `Message is too long (${text.length} characters, max ${SEND_MAX_CHARS}).`;
+			const group = await resolveOneGroup(db, a.group);
+			let reply: { id: string; sender: string; text: string } | undefined;
+			if (a.reply_to) {
+				const q = await findMessage(db, a.reply_to);
+				if (q.chat_jid !== group.jid) return `Message #${a.reply_to} is in ${q.gname}, not ${group.name}.`;
+				reply = { id: q.id.slice(q.chat_jid.length + 1), sender: q.sender_jid ?? "", text: q.text ?? "" };
+			}
+			const sent = await bridge.send(group.jid, text, reply);
+			return `Sent to ${group.name} at ${fmtTime(sent.ts)}${reply ? " (as a reply)" : ""}. #${sent.id}`;
+		}
+
 		case "bridge_status":
 			return JSON.stringify(await bridge.status(), null, 2);
 
@@ -434,7 +609,7 @@ async function callTool(name: string, args: any, env: Env, bridge: DurableObject
 			const rows = await db
 				.prepare(
 					`SELECT * FROM (
-					   SELECT m.*, COALESCE(g.name, m.chat_name, m.chat_jid) AS gname
+					   SELECT ${COLS}, COALESCE(g.name, m.chat_name, m.chat_jid) AS gname
 					   FROM messages m LEFT JOIN groups g ON g.jid = m.chat_jid
 					   WHERE m.ts >= ? ${clause} ORDER BY m.ts DESC LIMIT ?
 					 ) ORDER BY ts ASC`,
@@ -457,7 +632,7 @@ async function callTool(name: string, args: any, env: Env, bridge: DurableObject
 			const wordBinds = words.flatMap((w) => [`%${w}%`, `%${w}%`]);
 			const rows = await db
 				.prepare(
-					`SELECT m.*, COALESCE(g.name, m.chat_name, m.chat_jid) AS gname
+					`SELECT ${COLS}, COALESCE(g.name, m.chat_name, m.chat_jid) AS gname
 					 FROM messages m LEFT JOIN groups g ON g.jid = m.chat_jid
 					 WHERE m.ts >= ? ${clause} ${wordClause} ORDER BY m.ts DESC LIMIT ?`,
 				)
@@ -470,7 +645,44 @@ async function callTool(name: string, args: any, env: Env, bridge: DurableObject
 	throw new Error(`Unknown tool ${name}`);
 }
 
-type Row = BufferedMsg & { gname: string; from_me: any };
+type Row = BufferedMsg & { gname: string; from_me: any; has_media?: number };
+
+/** Finds a message by the short id shown after # (or the full chat:id). */
+async function findMessage(db: D1Database, raw: unknown) {
+	const id = String(raw ?? "").trim().replace(/^#/, "");
+	if (!id) throw new Error("message_id is required.");
+	const row = await db
+		.prepare(
+			`SELECT ${COLS}, COALESCE(g.name, m.chat_name, m.chat_jid) AS gname
+			 FROM messages m LEFT JOIN groups g ON g.jid = m.chat_jid
+			 WHERE m.id = ?1 OR m.id LIKE '%:' || ?1 ORDER BY m.ts DESC LIMIT 1`,
+		)
+		.bind(id)
+		.first<Row>();
+	if (!row) throw new Error(`No message with id #${id}.`);
+	return { ...row, who: row.from_me ? "Me" : row.sender_name || shortJid(row.sender_jid) };
+}
+
+/** Resolves a group name to exactly one group, or explains why it can't. */
+async function resolveOneGroup(db: D1Database, group: unknown): Promise<{ jid: string; name: string }> {
+	const g = String(group ?? "").trim();
+	if (!g) throw new Error("group is required.");
+	const hits = await db
+		.prepare(
+			`SELECT jid, name FROM groups WHERE name LIKE ?1 OR jid = ?2
+			 UNION SELECT DISTINCT chat_jid, chat_name FROM messages WHERE chat_name LIKE ?1 OR chat_jid = ?2`,
+		)
+		.bind(`%${g}%`, g)
+		.all<{ jid: string; name: string | null }>();
+	const byJid = new Map<string, string>();
+	for (const h of hits.results) if (!byJid.has(h.jid) || h.name) byJid.set(h.jid, h.name || h.jid);
+	const list = [...byJid].map(([jid, name]) => ({ jid, name }));
+	if (!list.length) throw new Error(`No group matches "${g}". Nothing was sent.`);
+	if (list.length === 1) return list[0];
+	const exact = list.filter((x) => x.name.toLowerCase() === g.toLowerCase());
+	if (exact.length === 1) return exact[0];
+	throw new Error(`"${g}" matches ${list.length} groups: ${list.map((x) => x.name).join(", ")}. Nothing was sent; use the full name.`);
+}
 
 async function groupFilter(db: D1Database, group: unknown): Promise<{ clause: string; binds: string[]; label: string }> {
 	const g = String(group ?? "").trim();
@@ -495,7 +707,9 @@ function formatRows(rows: Row[], header: string): string {
 		const who = r.from_me ? "Me" : r.sender_name || shortJid(r.sender_jid);
 		const where = multi ? `{${r.gname}} ` : "";
 		const reply = r.quoted_text ? `  (replying to: "${oneLine(r.quoted_text, 120)}")` : "";
-		return `[${fmtTime(r.ts)}] ${where}${who}: ${r.text ?? ""}${reply}`;
+		const photo = r.has_media ? " (photo)" : "";
+		const id = r.id.slice(r.chat_jid.length + 1);
+		return `[${fmtTime(r.ts)}] ${where}${who}: ${r.text ?? ""}${reply}${photo} #${id}`;
 	});
 	const groupLine = multi ? "" : `Group: ${rows[0].gname}\n`;
 	return `${header}\n${groupLine}\n${lines.join("\n")}`;
@@ -525,6 +739,12 @@ function oneLine(s: string, n: number): string {
 function clamp(n: number, lo: number, hi: number): number {
 	return Math.min(hi, Math.max(lo, n));
 }
+function toBase64(buf: ArrayBuffer): string {
+	const bytes = new Uint8Array(buf);
+	let bin = "";
+	for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+	return btoa(bin);
+}
 function sleep(ms: number) {
 	return new Promise((r) => setTimeout(r, ms));
 }
@@ -548,7 +768,7 @@ const LINK_PAGE = `<!doctype html>
  ol{padding-left:20px;line-height:1.6;font-size:15px} dl{display:grid;grid-template-columns:auto 1fr;gap:6px 12px;font-size:14px}
  dt{color:#667} button{margin-top:18px;background:none;border:1px solid #ccd;border-radius:8px;padding:8px 12px;color:#556;cursor:pointer}
 </style></head><body><div class="card">
-<h1>NDX WhatsApp Yard</h1><p class="sub">Read-only sync of your WhatsApp groups</p>
+<h1>NDX WhatsApp Yard</h1><p class="sub">Sync of your WhatsApp groups</p>
 <div id="state"><span class="pill wait">Starting…</span></div>
 <div id="qr"></div>
 <div id="steps" style="display:none"><ol>
