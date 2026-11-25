@@ -104,6 +104,7 @@ func main() {
 	mux.HandleFunc("/groups", b.handleGroups)
 	mux.HandleFunc("/send", b.handleSend)
 	mux.HandleFunc("/media", b.handleMedia)
+	mux.HandleFunc("/backfill", b.handleBackfill)
 
 	srv := &http.Server{Addr: ":8080", Handler: mux}
 	go func() {
@@ -455,6 +456,56 @@ func (b *bridge) handleMedia(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", firstNonEmpty(img.GetMimetype(), "image/jpeg"))
 	w.Write(data)
+}
+
+// handleBackfill asks the phone to resend up to `count` messages older than the
+// given anchor message in one group (like WhatsApp Web scrolling up). The phone
+// answers later with a HistorySync event, which flows through onHistory.
+// POST body: {"chat_jid","anchor_id","anchor_ts","anchor_from_me","count"}.
+func (b *bridge) handleBackfill(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", 405)
+		return
+	}
+	var req struct {
+		ChatJID      string `json:"chat_jid"`
+		AnchorID     string `json:"anchor_id"`
+		AnchorTS     int64  `json:"anchor_ts"`
+		AnchorFromMe bool   `json:"anchor_from_me"`
+		Count        int    `json:"count"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 16<<10)).Decode(&req); err != nil {
+		http.Error(w, "bad json: "+err.Error(), 400)
+		return
+	}
+	chat, err := types.ParseJID(req.ChatJID)
+	if err != nil || chat.Server != types.GroupServer || req.AnchorID == "" {
+		http.Error(w, "need a group chat_jid and anchor_id", 400)
+		return
+	}
+	if req.Count <= 0 || req.Count > 100 {
+		req.Count = 50
+	}
+	b.mu.Lock()
+	cli := b.client
+	b.mu.Unlock()
+	if cli == nil || !cli.IsLoggedIn() {
+		http.Error(w, "not connected", 503)
+		return
+	}
+	info := &types.MessageInfo{
+		MessageSource: types.MessageSource{Chat: chat, IsFromMe: req.AnchorFromMe, IsGroup: true},
+		ID:            req.AnchorID,
+		Timestamp:     time.Unix(req.AnchorTS, 0),
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	if _, err := cli.SendPeerMessage(ctx, cli.BuildHistorySyncRequest(info, req.Count)); err != nil {
+		http.Error(w, "request failed: "+err.Error(), 502)
+		return
+	}
+	log.Printf("asked phone for %d messages before %s in %s", req.Count, req.AnchorID, chat)
+	writeJSON(w, map[string]any{"ok": true})
 }
 
 // imageOf finds a photo inside a message (including view-once / ephemeral wrappers).
